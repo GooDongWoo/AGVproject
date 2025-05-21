@@ -7,8 +7,7 @@
 #include <chrono>
 #include <ctime>
 #include <cstring>
-#include <functional>
-#include <sstream>
+#include <random>
 #include <nlohmann/json.hpp>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -20,27 +19,83 @@ using json = nlohmann::json;
 
 // 서버 설정
 const int PORT = 5000;
-const int MAX_CONNECTIONS = 3;
+const int MAX_CONNECTIONS = 5;
 const int BUFFER_SIZE = 4096;
 
-// AGV 상태 구조체
-struct AgvStatus {
-    json status;
-    std::string lastUpdate;
-};
-
 // 전역 변수
-std::map<std::string, AgvStatus> agvStatusMap;
-std::map<int, std::thread> clientThreads;
-std::mutex statusMutex; // 상태 맵 접근 보호용 뮤텍스
+std::mutex clientsMutex;
+std::vector<int> raspberryPiSockets;
+std::random_device rd;
+std::mt19937 gen;
 
 // 현재 시간을 문자열로 반환하는 함수
 std::string getCurrentTimeString() {
     auto now = std::chrono::system_clock::now();
     std::time_t now_time = std::chrono::system_clock::to_time_t(now);
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&now_time), "%Y-%m-%d %H:%M:%S");
-    return ss.str();
+    char timeStr[20];
+    std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&now_time));
+    return std::string(timeStr);
+}
+
+// 라즈베리 파이에 명령 전송 함수
+void sendCommandToRaspberryPi(int clientSocket, const std::string& agvId) {
+    try {
+        // 랜덤 숫자 생성기 초기화
+        std::uniform_int_distribution<> flagDis(0, 1);     // 시작 플래그 (0 또는 1)
+        std::uniform_int_distribution<> locDis(0, 5);      // 위치 (0~5)
+        std::uniform_int_distribution<> delayDis(0, 100);  // 지연 시간 (0~100초)
+
+        // 시작 플래그, 위치, 지연 시간 랜덤 생성
+        int startFlag = flagDis(gen);
+        int startLocation = locDis(gen);
+        int destLocation = locDis(gen);
+        int delaySeconds = delayDis(gen);
+        
+        // 명령 생성
+        json command = {
+            {"start_flag", startFlag},
+            {"start_location", startLocation},
+            {"destination", destLocation},
+            {"delay_seconds", delaySeconds},
+            {"agv_id", agvId},
+            {"timestamp", getCurrentTimeString()}
+        };
+
+        // 명령 전송
+        std::string commandStr = command.dump();
+        int sendResult = send(clientSocket, commandStr.c_str(), commandStr.length(), 0);
+        
+        if (sendResult < 0) {
+            std::cerr << "명령 전송 실패: " << strerror(errno) << std::endl;
+        } else {
+            std::cout << "AGV " << agvId << "에 명령 전송 완료: " << commandStr << std::endl;
+        }
+    }
+    catch (const std::exception& e) {
+        std::cerr << "명령 전송 중 오류 발생: " << e.what() << std::endl;
+    }
+}
+
+// 모든 라즈베리 파이에 주기적으로 명령 전송하는 함수
+void periodicCommandSender() {
+    std::vector<std::string> agvIds = {"AGV_1", "AGV_2"};
+    
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::minutes(1)); // 1분 간격
+        
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        if (raspberryPiSockets.empty()) {
+            std::cout << "연결된 라즈베리 파이가 없습니다." << std::endl;
+            continue;
+        }
+        
+        // 각 AGV에 대해 명령 생성 및 전송
+        for (const auto& agvId : agvIds) {
+            for (int socket : raspberryPiSockets) {
+                sendCommandToRaspberryPi(socket, agvId);
+            }
+        }
+    }
 }
 
 // 클라이언트 처리 함수
@@ -48,8 +103,50 @@ void handleClient(int clientSocket, const std::string& clientAddr) {
     std::cout << "연결됨: " << clientAddr << std::endl;
 
     char buffer[BUFFER_SIZE];
+    bool isRaspberryPi = false;
 
     try {
+        // 초기 메시지 수신으로 클라이언트 유형 판별
+        memset(buffer, 0, BUFFER_SIZE);
+        int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+        
+        if (bytesReceived <= 0) {
+            std::cerr << "초기 데이터 수신 실패" << std::endl;
+            close(clientSocket);
+            return;
+        }
+        
+        std::string dataStr(buffer);
+        json clientData;
+        
+        try {
+            clientData = json::parse(dataStr);
+            // 클라이언트 유형 확인
+            if (clientData.contains("client_type") && clientData["client_type"] == "raspberry_pi") {
+                isRaspberryPi = true;
+                std::cout << "라즈베리 파이 클라이언트 연결됨: " << clientAddr << std::endl;
+                
+                // 라즈베리 파이 소켓 목록에 추가
+                {
+                    std::lock_guard<std::mutex> lock(clientsMutex);
+                    raspberryPiSockets.push_back(clientSocket);
+                }
+                
+                // 라즈베리 파이에게 연결 확인 응답
+                json response = {
+                    {"status", "connected"},
+                    {"message", "라즈베리 파이 연결 성공"}
+                };
+                std::string responseStr = response.dump();
+                send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
+            }
+        }
+        catch (const json::parse_error& e) {
+            std::cerr << "JSON 파싱 오류: " << e.what() << std::endl;
+            close(clientSocket);
+            return;
+        }
+        
         while (true) {
             // 데이터 수신
             memset(buffer, 0, BUFFER_SIZE);
@@ -59,43 +156,21 @@ void handleClient(int clientSocket, const std::string& clientAddr) {
                 break; // 연결 종료 또는 오류
             }
 
-            // JSON 파싱
-            std::string dataStr(buffer);
-            json agvData;
-
-            try {
-                agvData = json::parse(dataStr);
-                std::string agvId = agvData["agv_id"];
-
-                // AGV 상태 업데이트
-                std::lock_guard<std::mutex> lock(statusMutex);
-                agvStatusMap[agvId] = {
-                    agvData,
-                    getCurrentTimeString()
-                };
-
-                std::cout << "AGV " << agvId << " 상태 업데이트: " << agvData.dump() << std::endl;
-
-                // 명령 생성 (예시)
-                json command = {
-                    {"command_id", 1},
-                    {"agv_id", agvId},
-                    {"action", "move"},
-                    {"parameters", {{"x", 100}, {"y", 200}}}
-                };
-
-                // 명령 전송
-                std::string commandStr = command.dump();
-                send(clientSocket, commandStr.c_str(), commandStr.length(), 0);
-
-            }
-            catch (const json::parse_error& e) {
-                std::cerr << "JSON 파싱 오류: " << e.what() << std::endl;
-            }
+            // 수신 데이터 확인 (간단한 로깅만)
+            std::cout << "데이터 수신: " << buffer << std::endl;
         }
     }
     catch (const std::exception& e) {
         std::cerr << "클라이언트 처리 오류: " << e.what() << std::endl;
+    }
+
+    // 라즈베리 파이 소켓 목록에서 제거
+    if (isRaspberryPi) {
+        std::lock_guard<std::mutex> lock(clientsMutex);
+        raspberryPiSockets.erase(
+            std::remove(raspberryPiSockets.begin(), raspberryPiSockets.end(), clientSocket),
+            raspberryPiSockets.end()
+        );
     }
 
     // 연결 종료
@@ -103,27 +178,10 @@ void handleClient(int clientSocket, const std::string& clientAddr) {
     std::cout << "연결 종료: " << clientAddr << std::endl;
 }
 
-// AGV 상태 출력 함수
-void showAgvStatus() {
-    while (true) {
-        {
-            std::lock_guard<std::mutex> lock(statusMutex);
-
-            std::cout << "\n=== AGV 운용 현황 ===" << std::endl;
-            for (const auto& pair : agvStatusMap) {
-                std::cout << "AGV ID: " << pair.first << std::endl;
-                std::cout << "상태: " << pair.second.status.dump(4) << std::endl;
-                std::cout << "마지막 업데이트: " << pair.second.lastUpdate << std::endl;
-                std::cout << "------------------------------" << std::endl;
-            }
-        }
-
-        // 10초마다 업데이트
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-    }
-}
-
 int main() {
+    // 랜덤 숫자 생성기 초기화
+    gen = std::mt19937(rd());
+    
     // 소켓 생성
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSocket == -1) {
@@ -160,10 +218,10 @@ int main() {
     }
 
     std::cout << "서버가 포트 " << PORT << "에서 실행 중..." << std::endl;
-
-    // AGV 상태 모니터링 스레드 시작
-    std::thread statusThread(showAgvStatus);
-    statusThread.detach();
+    
+    // 주기적 명령 전송 스레드 시작
+    std::thread commandThread(periodicCommandSender);
+    commandThread.detach();
 
     // 메인 루프
     try {
@@ -197,4 +255,3 @@ int main() {
 
     return 0;
 }
-
