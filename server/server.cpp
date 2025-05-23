@@ -80,14 +80,14 @@ void printHelp() {
         std::cout << COLOR_LIST[i];
         if (i < COLOR_LIST.size() - 1) std::cout << ", ";
     }
-    std::cout << std::endl;
+    std::cout << "\n물건 인덱스: 0-10 (총 11개 물건)" << std::endl;
     std::cout << "========================\n" << std::endl;
 }
 
 // 특정 라즈베리파이에 명령 전송
 bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId, 
                                        const std::string& startColor, const std::string& endColor, 
-                                       int delaySeconds) {
+                                       int delaySeconds, int itemIdx) {
     std::lock_guard<std::mutex> lock(clientsMutex);
     
     if (socketIndex < 0 || socketIndex >= static_cast<int>(raspberryPiSockets.size())) {
@@ -117,7 +117,8 @@ bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId,
             {"end", endIndex},
             {"delays", delaySeconds},
             {"agv_id", agvId},
-            {"timedata", getCurrentTimeString()}
+            {"timedata", getCurrentTimeString()},
+            {"item_idx", itemIdx}
         };
         
         // 명령 전송
@@ -134,6 +135,7 @@ bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId,
             std::cout << "   경로: " << startColor << "(" << startIndex << ") → " 
                       << endColor << "(" << endIndex << ")" << std::endl;
             std::cout << "   지연시간: " << delaySeconds << "초" << std::endl;
+            std::cout << "   물건 인덱스: " << itemIdx << std::endl;
             std::cout << "   전송 데이터: " << commandStr << std::endl;
             return true;
         }
@@ -157,7 +159,7 @@ void interactiveSendCommand() {
     
     int raspberryPiIndex;
     std::string agvId, startColor, endColor;
-    int delaySeconds;
+    int delaySeconds, itemIdx;
     
     std::cout << "라즈베리파이 번호를 선택하세요 (1-" << raspberryPiSockets.size() << "): ";
     std::cin >> raspberryPiIndex;
@@ -179,7 +181,10 @@ void interactiveSendCommand() {
     std::cout << "지연 시간(초)을 입력하세요: ";
     std::cin >> delaySeconds;
     
-    sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds);
+    std::cout << "물건 인덱스를 입력하세요 (0-10): ";
+    std::cin >> itemIdx;
+    
+    sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds, itemIdx);
 }
 
 // 빠른 명령 전송 (한 줄 입력)
@@ -192,8 +197,8 @@ void quickSendCommand() {
     }
     lock.~lock_guard();
     
-    std::cout << "형식: <라즈베리파이번호> <AGV_ID> <시작색상> <끝색상> <지연시간>" << std::endl;
-    std::cout << "예시: 1 AGV_1 red blue 5" << std::endl;
+    std::cout << "형식: <라즈베리파이번호> <AGV_ID> <시작색상> <끝색상> <지연시간> <물건인덱스>" << std::endl;
+    std::cout << "예시: 1 AGV_1 red blue 5 3" << std::endl;
     std::cout << "입력: ";
     
     std::string line;
@@ -203,11 +208,11 @@ void quickSendCommand() {
     std::istringstream iss(line);
     int raspberryPiIndex;
     std::string agvId, startColor, endColor;
-    int delaySeconds;
+    int delaySeconds, itemIdx;
     
-    if (iss >> raspberryPiIndex >> agvId >> startColor >> endColor >> delaySeconds) {
+    if (iss >> raspberryPiIndex >> agvId >> startColor >> endColor >> delaySeconds >> itemIdx) {
         raspberryPiIndex--; // 0-based 인덱스로 변환
-        sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds);
+        sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds, itemIdx);
     } else {
         std::cout << "입력 형식이 올바르지 않습니다." << std::endl;
     }
@@ -240,6 +245,7 @@ void userInputHandler() {
                 std::cout << COLOR_LIST[i] << "(" << i << ")";
                 if (i < COLOR_LIST.size() - 1) std::cout << ", ";
             }
+            std::cout << "\n물건 인덱스: 0-10" << std::endl;
             std::cout << "\n" << std::endl;
         }
         else if (command == "send") {

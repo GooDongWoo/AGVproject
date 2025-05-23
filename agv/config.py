@@ -2,7 +2,7 @@
 # coding: utf-8
 
 """
-AGV 설정 파일 - JSON 송수신 기능 포함
+AGV 설정 파일 - JSON 송수신 기능 포함 (로봇팔 설정 추가)
 """
 
 import numpy as np
@@ -58,5 +58,16 @@ STEERING_DGAIN = 0.0
 STEERING_BIAS = 0.0
 ROAD_FOLLOWING_INTERVAL = 0.1
 
-# 서보 모터 설정
+# 로봇팔 설정
+ROBOT_ARM_ENABLED = True  # 로봇팔 사용 여부
+ARM_PICK_HEIGHT_OFFSET = 20  # 집기 전 높이 오프셋 (mm)
+ARM_PLACE_HEIGHT_OFFSET = 50  # 놓기 전 높이 오프셋 (mm)
+ARM_SAFE_HEIGHT = 100  # 안전 높이 (mm)
+ARM_OPERATION_DELAY = 2.0  # 로봇팔 동작 대기 시간 (초)
+
+# 물건 탐지 설정
+OBJECT_DETECTION_TIMEOUT = 10.0  # 물건 탐지 타임아웃 (초)
+MARKER_DETECTION_RETRIES = 5  # ArUco 마커 탐지 재시도 횟수
+
+# 서보 모터 설정 (기존 호환성)
 SERVO_ACTION_DURATION = 2.0

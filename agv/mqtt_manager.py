@@ -81,7 +81,7 @@ class MQTTManager:
             print(f"원본 명령 수신: {command_data}")
             
             # 필수 필드 확인
-            required_fields = ["timedata", "start", "end", "delays"]
+            required_fields = ["timedata", "start", "end", "delays", "item_idx"]
             if not all(field in command_data for field in required_fields):
                 print("필수 필드 누락된 명령 무시")
                 return
@@ -99,7 +99,8 @@ class MQTTManager:
                 "timedata": command_data["timedata"],
                 "start": start_location,
                 "end": end_location,
-                "delays": command_data["delays"]
+                "delays": command_data["delays"],
+                "item_idx": command_data["item_idx"]
             }
             
             print(f"변환된 명령: {converted_command}")

@@ -296,7 +296,7 @@ class RaspberryPiBridge:
                     print(f"명령 수신: {command}")
                     
                     # 필수 필드 확인
-                    if all(field in command for field in ["agv_id", "start", "end", "delays"]):
+                    if all(field in command for field in ["agv_id", "start", "end", "delays", "item_idx"]):
                         agv_id = str(command["agv_id"])  # 문자열로 통일
                         
                         # MQTT를 통해 AGV에 명령 전달
@@ -309,12 +309,13 @@ class RaspberryPiBridge:
                                 "start": command["start"],
                                 "end": command["end"],
                                 "delays": int(command["delays"]),
-                                "timestamp": command.get("timedata", datetime.now().isoformat())
+                                "item_idx": int(command["item_idx"]),
+                                "timedata": command.get("timedata", datetime.now().isoformat())
                             }
                             
                             command_json = json.dumps(agv_command, ensure_ascii=False)
                             self.mqtt_client.publish(mqtt_topic, command_json)
-                            print(f"명령 전달 완료: AGV {agv_id}")
+                            print(f"명령 전달 완료: AGV {agv_id} (물건 인덱스: {command['item_idx']})")
                         else:
                             print("MQTT 연결 없음")
                     else:
