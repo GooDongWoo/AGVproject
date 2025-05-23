@@ -62,8 +62,11 @@ class RaspberryPiBridge:
             print("서버 연결 성공")
             
             # 라즈베리 파이로 식별
-            ident_data = {"client_type": "raspberry_pi"}
-            data_string = json.dumps(ident_data)
+            ident_data = {
+                "client_type": "raspberry_pi",
+                "timestamp": datetime.now().isoformat()
+            }
+            data_string = json.dumps(ident_data, ensure_ascii=False)
             self.socket.sendall(data_string.encode('utf-8'))
             
             return True
@@ -118,7 +121,7 @@ class RaspberryPiBridge:
             # 토픽에서 AGV ID 추출 (agv/{agv_id}/sensing)
             topic_parts = topic.split('/')
             if len(topic_parts) >= 3 and topic_parts[0] == 'agv' and topic_parts[2] == 'sensing':
-                agv_id = topic_parts[1]
+                agv_id = str(topic_parts[1])  # 문자열로 통일
                 
                 # JSON 데이터 파싱
                 sensing_data = json.loads(message)
@@ -225,20 +228,20 @@ class RaspberryPiBridge:
     def log_work_start(self, agv_id, timestamp):
         """작업 시작 로그"""
         log_entry = {
-            'agv_id': agv_id,
-            'event': 'work_start',
-            'timestamp': timestamp.isoformat(),
-            'work_id': self.agv_sensing_data[agv_id]['current_work_id']
+            "agv_id": str(agv_id),
+            "event": "work_start",
+            "timestamp": timestamp.isoformat(),
+            "work_id": self.agv_sensing_data[agv_id]['current_work_id']
         }
         self.write_log(log_entry)
     
     def log_work_completion(self, agv_id, timestamp):
         """작업 완료 로그"""
         log_entry = {
-            'agv_id': agv_id,
-            'event': 'work_complete',
-            'timestamp': timestamp.isoformat(),
-            'work_id': self.agv_sensing_data[agv_id]['current_work_id']
+            "agv_id": str(agv_id),
+            "event": "work_complete",
+            "timestamp": timestamp.isoformat(),
+            "work_id": self.agv_sensing_data[agv_id]['current_work_id']
         }
         self.write_log(log_entry)
     
@@ -258,15 +261,15 @@ class RaspberryPiBridge:
                 return
             
             status_data = {
-                'type': 'agv_status',
-                'agv_id': agv_id,
-                'status': agv_data['work_status'],
-                'is_finished': is_finished,
-                'last_update': agv_data['last_update'].isoformat() if agv_data['last_update'] else None,
-                'work_id': agv_data.get('current_work_id')
+                "type": "agv_status",
+                "agv_id": str(agv_id),
+                "status": agv_data['work_status'],
+                "is_finished": int(is_finished),
+                "timestamp": agv_data['last_update'].isoformat() if agv_data['last_update'] else None,
+                "work_id": agv_data.get('current_work_id')
             }
             
-            data_string = json.dumps(status_data)
+            data_string = json.dumps(status_data, ensure_ascii=False)
             self.socket.sendall(data_string.encode('utf-8'))
             print(f"📊 AGV {agv_id} 상태 정보 서버 전송")
             
@@ -293,13 +296,24 @@ class RaspberryPiBridge:
                     print(f"명령 수신: {command}")
                     
                     # 필수 필드 확인
-                    if "agv_id" in command and "start" in command and "end" in command and "delays" in command:
-                        agv_id = command["agv_id"]
+                    if all(field in command for field in ["agv_id", "start", "end", "delays"]):
+                        agv_id = str(command["agv_id"])  # 문자열로 통일
                         
                         # MQTT를 통해 AGV에 명령 전달
                         if self.connected_to_mqtt:
                             mqtt_topic = f"agv/{agv_id}/command"
-                            self.mqtt_client.publish(mqtt_topic, command_string)
+                            
+                            # 명령 데이터 통일된 형식으로 재구성
+                            agv_command = {
+                                "agv_id": agv_id,
+                                "start": command["start"],
+                                "end": command["end"],
+                                "delays": int(command["delays"]),
+                                "timestamp": command.get("timedata", datetime.now().isoformat())
+                            }
+                            
+                            command_json = json.dumps(agv_command, ensure_ascii=False)
+                            self.mqtt_client.publish(mqtt_topic, command_json)
                             print(f"명령 전달 완료: AGV {agv_id}")
                         else:
                             print("MQTT 연결 없음")
