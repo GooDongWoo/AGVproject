@@ -162,7 +162,8 @@ class MQTTManager:
             # JSON 데이터 구성
             sensing_data = {
                 "is_finished": 1 if self.is_finished else 0,
-                "bgr_image": bgr_image_b64
+                "bgr_image": bgr_image_b64,
+                "agv_id": AGV_ID
             }
             
             # MQTT로 송신
