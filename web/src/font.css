@@ -1,0 +1,31 @@
+/* Google Fonts Import */
+@import url('https://fonts.googleapis.com/css2?family=Sunflower:wght@300&family=Yeon+Sung&display=swap');
+
+/* Sunflower 폰트 클래스 */
+.sunflower-light {
+  font-family: "Sunflower", sans-serif;
+  font-weight: 300;
+  font-style: normal;
+}
+
+/* 전역 폰트 적용 */
+* {
+  font-family: "Sunflower", system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* 특정 요소들에 대한 폰트 최적화 */
+body, html {
+  font-family: "Sunflower", system-ui;
+  font-weight: 400;
+  font-style: normal;
+}
+
+/* 입력 요소들도 폰트 적용 */
+input, textarea, select, button {
+  font-family: inherit;
+}
+
+/* 차트나 특수 요소에서 폰트가 적용되지 않는 경우를 위한 강제 적용 */
+.chart-title, .num-title, .stat-label, .stat-value {
+  font-family: "Sunflower", system-ui !important;
+}
