@@ -2,7 +2,7 @@
 # coding: utf-8
 
 """
-MQTT 통신 관리 - JSON 송수신 기능 포함 (정수->문자열 변환 지원)
+MQTT 통신 관리 - 새로운 JSON 포맷 적용
 """
 
 import paho.mqtt.client as mqtt
@@ -11,6 +11,7 @@ import threading
 import time
 import base64
 import cv2
+import random
 from datetime import datetime
 from config import *
 
@@ -26,6 +27,11 @@ class MQTTManager:
         self.is_finished = False
         self.sensing_thread = None
         self.sensing_thread_flag = False
+        
+        # 작업 상태 관리
+        self.current_work_id = None
+        self.work_started = False
+        self.collision_occurred = False
         
     def connect(self):
         try:
@@ -120,10 +126,15 @@ class MQTTManager:
         self.is_finished = False
         self.sensing_thread_flag = True
         
+        # 작업 시작 시 새로운 workId 생성
+        self.current_work_id = random.randint(100000, 999999)
+        self.work_started = False
+        self.collision_occurred = False
+        
         self.sensing_thread = threading.Thread(target=self._sensing_loop)
         self.sensing_thread.daemon = True
         self.sensing_thread.start()
-        print("센서 데이터 송신 시작")
+        print(f"센서 데이터 송신 시작 - Work ID: {self.current_work_id}")
     
     def stop_sensing_transmission(self):
         """센서 데이터 송신 정지"""
@@ -138,6 +149,11 @@ class MQTTManager:
         """작업 완료 상태 설정"""
         self.is_finished = True
     
+    def trigger_collision(self):
+        """충돌 발생 신호"""
+        self.collision_occurred = True
+        print("충돌 발생 감지")
+    
     def _sensing_loop(self):
         """0.5초마다 센서 데이터 송신하는 루프"""
         while self.sensing_thread_flag and self.is_task_running:
@@ -149,27 +165,58 @@ class MQTTManager:
                 time.sleep(0.5)
     
     def _send_sensing_data(self):
-        """센서 데이터 송신"""
+        """센서 데이터 송신 - 새로운 JSON 포맷"""
         if not self.is_connected:
             return
             
         try:
+            # 현재 시간
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
             # 카메라에서 이미지 획득
-            bgr_image_b64 = ""
+            image_b64 = None
             if self.camera and self.camera.value is not None:
                 _, buffer = cv2.imencode('.jpg', self.camera.value)
-                bgr_image_b64 = base64.b64encode(buffer).decode('utf-8')
+                image_b64 = base64.b64encode(buffer).decode('utf-8')
             
-            # JSON 데이터 구성
+            # cmd_string 결정
+            cmd_string = None
+            if not self.work_started:
+                # 작업 시작
+                cmd_string = "start"
+                self.work_started = True
+                print(f"작업 시작 신호 전송 - Work ID: {self.current_work_id}")
+            elif self.collision_occurred:
+                # 충돌 발생
+                cmd_string = "col"
+                self.collision_occurred = False  # 충돌 신호 리셋
+                print(f"충돌 신호 전송 - Work ID: {self.current_work_id}")
+            elif self.is_finished:
+                # 작업 완료
+                cmd_string = "end"
+                print(f"작업 완료 신호 전송 - Work ID: {self.current_work_id}")
+            else:
+                # 작업 중
+                cmd_string = None
+            
+            # 새로운 JSON 데이터 구성
             sensing_data = {
-                "is_finished": 1 if self.is_finished else 0,
-                "bgr_image": bgr_image_b64,
-                "agv_id": AGV_ID
+                "agvId": int(AGV_ID),
+                "workId": self.current_work_id,
+                "cmd_string": cmd_string,
+                "time": current_time,
+                "image": image_b64,
+                "box_idx": 0,  # 필요시 실제 box_idx 값으로 업데이트
+                "is_finished": 1 if self.is_finished else 0
             }
             
             # MQTT로 송신
             json_data = json.dumps(sensing_data)
             self.client.publish(SENSING_TOPIC, json_data, 1)
+            
+            # 로그 출력 (cmd_string이 있을 때만)
+            if cmd_string:
+                print(f"센싱 데이터 전송: cmd_string={cmd_string}, workId={self.current_work_id}")
             
             if self.is_finished:
                 print("작업 완료 - 센서 데이터 송신 종료")
@@ -177,6 +224,10 @@ class MQTTManager:
                 
         except Exception as e:
             print(f"센서 데이터 생성/송신 오류: {e}")
+    
+    def set_box_index(self, box_idx):
+        """박스 인덱스 설정"""
+        self.box_idx = box_idx
     
     def disconnect(self):
         """연결 종료"""

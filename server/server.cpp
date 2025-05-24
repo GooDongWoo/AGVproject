@@ -9,27 +9,30 @@
 #include <cstring>
 #include <sstream>
 #include <nlohmann/json.hpp>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
+#include <mosquitto.h>
 
 // JSON 라이브러리 네임스페이스 사용
 using json = nlohmann::json;
 
+// 외부 MQTT 브로커 설정 (별도 브로커 서버 필요)
+const std::string MQTT_BROKER_HOST = "mqtt.broker.address";  // 실제 브로커 주소로 변경
+const int MQTT_BROKER_PORT = 1883;
+const std::string MQTT_USERNAME = "central_server";
+const std::string MQTT_PASSWORD = "AgvServer2025!";
+
+// MQTT 토픽
+const std::string COMMAND_TOPIC_PREFIX = "server/commands/";
+const std::string STATUS_TOPIC_PREFIX = "raspberrypi/status/";
+const std::string HEARTBEAT_TOPIC = "raspberrypi/heartbeat";
+
 // 서버 설정
-const int PORT = 5000;
-const int MAX_CONNECTIONS = 5;
-const int BUFFER_SIZE = 4096;
+const std::vector<std::string> COLOR_LIST = {"red", "green", "blue", "purple", "yellow", "orange"};
 
 // 전역 변수
-std::mutex clientsMutex;
-std::vector<int> raspberryPiSockets;
-std::map<int, std::string> socketToAddress; // 소켓 -> 주소 매핑
+std::mutex connectedRaspberryPisMutex;
+std::map<std::string, std::chrono::system_clock::time_point> connectedRaspberryPis; // ID -> 마지막 하트비트
 bool serverRunning = true;
-
-// 색상 목록 (AGV 설정과 동일)
-const std::vector<std::string> COLOR_LIST = {"red", "green", "blue", "purple", "yellow", "orange"};
+struct mosquitto *mosq = nullptr;
 
 // 현재 시간을 문자열로 반환하는 함수
 std::string getCurrentTimeString() {
@@ -50,17 +53,68 @@ int getColorIndex(const std::string& colorName) {
     return -1; // 찾지 못한 경우
 }
 
+// MQTT 연결 콜백
+void on_connect(struct mosquitto *mosq, void *userdata, int result) {
+    if (result == 0) {
+        std::cout << "✅ MQTT 브로커 연결 성공" << std::endl;
+        
+        // 상태 및 하트비트 토픽 구독
+        mosquitto_subscribe(mosq, nullptr, (STATUS_TOPIC_PREFIX + "+").c_str(), 1);
+        mosquitto_subscribe(mosq, nullptr, HEARTBEAT_TOPIC.c_str(), 1);
+        
+        std::cout << "📡 토픽 구독 완료" << std::endl;
+    } else {
+        std::cout << "❌ MQTT 연결 실패: " << result << std::endl;
+    }
+}
+
+// MQTT 메시지 수신 콜백
+void on_message(struct mosquitto *mosq, void *userdata, const struct mosquitto_message *message) {
+    std::string topic(message->topic);
+    std::string payload((char*)message->payload, message->payloadlen);
+    
+    try {
+        json messageData = json::parse(payload);
+        
+        // 하트비트 처리
+        if (topic == HEARTBEAT_TOPIC) {
+            std::string raspberryPiId = messageData["raspberry_pi_id"];
+            {
+                std::lock_guard<std::mutex> lock(connectedRaspberryPisMutex);
+                connectedRaspberryPis[raspberryPiId] = std::chrono::system_clock::now();
+            }
+            std::cout << "💓 하트비트 수신: " << raspberryPiId << std::endl;
+            return;
+        }
+        
+        // 상태 메시지 처리
+        if (topic.find(STATUS_TOPIC_PREFIX) == 0) {
+            std::string raspberryPiId = topic.substr(STATUS_TOPIC_PREFIX.length());
+            std::cout << "📊 상태 수신 [" << raspberryPiId << "]: " << messageData.dump() << std::endl;
+            return;
+        }
+        
+    } catch (const json::parse_error& e) {
+        std::cout << "❌ JSON 파싱 오류: " << e.what() << std::endl;
+    }
+}
+
 // 연결된 라즈베리파이 목록 출력
 void printConnectedRaspberryPis() {
-    std::lock_guard<std::mutex> lock(clientsMutex);
+    std::lock_guard<std::mutex> lock(connectedRaspberryPisMutex);
     std::cout << "\n=== 연결된 라즈베리파이 목록 ===" << std::endl;
-    if (raspberryPiSockets.empty()) {
+    
+    auto now = std::chrono::system_clock::now();
+    if (connectedRaspberryPis.empty()) {
         std::cout << "연결된 라즈베리파이가 없습니다." << std::endl;
     } else {
-        for (size_t i = 0; i < raspberryPiSockets.size(); i++) {
-            int socket = raspberryPiSockets[i];
-            std::string address = socketToAddress[socket];
-            std::cout << "[" << (i + 1) << "] " << address << " (소켓: " << socket << ")" << std::endl;
+        int index = 1;
+        for (const auto& pair : connectedRaspberryPis) {
+            auto timeDiff = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
+            std::string status = (timeDiff < 30) ? "🟢 온라인" : "🔴 오프라인";
+            std::cout << "[" << index << "] " << pair.first << " - " << status 
+                      << " (마지막 하트비트: " << timeDiff << "초 전)" << std::endl;
+            index++;
         }
     }
     std::cout << "==============================\n" << std::endl;
@@ -85,32 +139,24 @@ void printHelp() {
 }
 
 // 특정 라즈베리파이에 명령 전송
-bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId, 
-                                       const std::string& startColor, const std::string& endColor, 
-                                       int delaySeconds, int itemIdx) {
-    std::lock_guard<std::mutex> lock(clientsMutex);
+bool sendCommandToRaspberryPi(const std::string& raspberryPiId, const std::string& agvId, 
+                              const std::string& startColor, const std::string& endColor, 
+                              int delaySeconds, int itemIdx) {
     
-    if (socketIndex < 0 || socketIndex >= static_cast<int>(raspberryPiSockets.size())) {
-        std::cout << "잘못된 라즈베리파이 번호입니다." << std::endl;
+    // 색상을 인덱스로 변환
+    int startIndex = getColorIndex(startColor);
+    int endIndex = getColorIndex(endColor);
+    
+    if (startIndex == -1) {
+        std::cout << "잘못된 시작 색상: " << startColor << std::endl;
+        return false;
+    }
+    if (endIndex == -1) {
+        std::cout << "잘못된 끝 색상: " << endColor << std::endl;
         return false;
     }
     
-    int clientSocket = raspberryPiSockets[socketIndex];
-    
     try {
-        // 색상을 인덱스로 변환
-        int startIndex = getColorIndex(startColor);
-        int endIndex = getColorIndex(endColor);
-        
-        if (startIndex == -1) {
-            std::cout << "잘못된 시작 색상: " << startColor << std::endl;
-            return false;
-        }
-        if (endIndex == -1) {
-            std::cout << "잘못된 끝 색상: " << endColor << std::endl;
-            return false;
-        }
-        
         // 명령 생성 (인덱스 사용)
         json command = {
             {"start", startIndex},
@@ -121,23 +167,28 @@ bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId,
             {"item_idx", itemIdx}
         };
         
-        // 명령 전송
+        // MQTT 토픽 생성
+        std::string topic = COMMAND_TOPIC_PREFIX + raspberryPiId;
         std::string commandStr = command.dump();
-        int sendResult = send(clientSocket, commandStr.c_str(), commandStr.length(), 0);
         
-        if (sendResult < 0) {
-            std::cout << "명령 전송 실패: " << strerror(errno) << std::endl;
-            return false;
-        } else {
+        // MQTT로 명령 전송
+        int result = mosquitto_publish(mosq, nullptr, topic.c_str(), 
+                                      commandStr.length(), commandStr.c_str(), 1, false);
+        
+        if (result == MOSQ_ERR_SUCCESS) {
             std::cout << "✅ 명령 전송 성공!" << std::endl;
-            std::cout << "   대상: " << socketToAddress[clientSocket] << std::endl;
+            std::cout << "   대상: " << raspberryPiId << std::endl;
             std::cout << "   AGV ID: " << agvId << std::endl;
             std::cout << "   경로: " << startColor << "(" << startIndex << ") → " 
                       << endColor << "(" << endIndex << ")" << std::endl;
             std::cout << "   지연시간: " << delaySeconds << "초" << std::endl;
             std::cout << "   물건 인덱스: " << itemIdx << std::endl;
+            std::cout << "   토픽: " << topic << std::endl;
             std::cout << "   전송 데이터: " << commandStr << std::endl;
             return true;
+        } else {
+            std::cout << "명령 전송 실패: " << mosquitto_strerror(result) << std::endl;
+            return false;
         }
     }
     catch (const std::exception& e) {
@@ -150,8 +201,23 @@ bool sendCommandToSpecificRaspberryPi(int socketIndex, const std::string& agvId,
 void interactiveSendCommand() {
     printConnectedRaspberryPis();
     
-    std::lock_guard<std::mutex> lock(clientsMutex);
-    if (raspberryPiSockets.empty()) {
+    std::lock_guard<std::mutex> lock(connectedRaspberryPisMutex);
+    if (connectedRaspberryPis.empty()) {
+        return;
+    }
+    
+    // 온라인 상태 라즈베리파이만 필터링
+    std::vector<std::string> onlineRaspberryPis;
+    auto now = std::chrono::system_clock::now();
+    for (const auto& pair : connectedRaspberryPis) {
+        auto timeDiff = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
+        if (timeDiff < 30) {
+            onlineRaspberryPis.push_back(pair.first);
+        }
+    }
+    
+    if (onlineRaspberryPis.empty()) {
+        std::cout << "온라인 상태인 라즈베리파이가 없습니다." << std::endl;
         return;
     }
     
@@ -161,9 +227,16 @@ void interactiveSendCommand() {
     std::string agvId, startColor, endColor;
     int delaySeconds, itemIdx;
     
-    std::cout << "라즈베리파이 번호를 선택하세요 (1-" << raspberryPiSockets.size() << "): ";
+    std::cout << "라즈베리파이 번호를 선택하세요 (1-" << onlineRaspberryPis.size() << "): ";
     std::cin >> raspberryPiIndex;
     raspberryPiIndex--; // 0-based 인덱스로 변환
+    
+    if (raspberryPiIndex < 0 || raspberryPiIndex >= static_cast<int>(onlineRaspberryPis.size())) {
+        std::cout << "잘못된 라즈베리파이 번호입니다." << std::endl;
+        return;
+    }
+    
+    std::string selectedRaspberryPi = onlineRaspberryPis[raspberryPiIndex];
     
     std::cout << "AGV ID를 입력하세요: ";
     std::cin >> agvId;
@@ -184,17 +257,33 @@ void interactiveSendCommand() {
     std::cout << "물건 인덱스를 입력하세요 (0-10): ";
     std::cin >> itemIdx;
     
-    sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds, itemIdx);
+    sendCommandToRaspberryPi(selectedRaspberryPi, agvId, startColor, endColor, delaySeconds, itemIdx);
 }
 
 // 빠른 명령 전송 (한 줄 입력)
 void quickSendCommand() {
     printConnectedRaspberryPis();
     
-    std::lock_guard<std::mutex> lock(clientsMutex);
-    if (raspberryPiSockets.empty()) {
+    std::lock_guard<std::mutex> lock(connectedRaspberryPisMutex);
+    if (connectedRaspberryPis.empty()) {
         return;
     }
+    
+    // 온라인 상태 라즈베리파이만 필터링
+    std::vector<std::string> onlineRaspberryPis;
+    auto now = std::chrono::system_clock::now();
+    for (const auto& pair : connectedRaspberryPis) {
+        auto timeDiff = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
+        if (timeDiff < 30) {
+            onlineRaspberryPis.push_back(pair.first);
+        }
+    }
+    
+    if (onlineRaspberryPis.empty()) {
+        std::cout << "온라인 상태인 라즈베리파이가 없습니다." << std::endl;
+        return;
+    }
+    
     lock.~lock_guard();
     
     std::cout << "형식: <라즈베리파이번호> <AGV_ID> <시작색상> <끝색상> <지연시간> <물건인덱스>" << std::endl;
@@ -212,7 +301,13 @@ void quickSendCommand() {
     
     if (iss >> raspberryPiIndex >> agvId >> startColor >> endColor >> delaySeconds >> itemIdx) {
         raspberryPiIndex--; // 0-based 인덱스로 변환
-        sendCommandToSpecificRaspberryPi(raspberryPiIndex, agvId, startColor, endColor, delaySeconds, itemIdx);
+        
+        if (raspberryPiIndex >= 0 && raspberryPiIndex < static_cast<int>(onlineRaspberryPis.size())) {
+            std::string selectedRaspberryPi = onlineRaspberryPis[raspberryPiIndex];
+            sendCommandToRaspberryPi(selectedRaspberryPi, agvId, startColor, endColor, delaySeconds, itemIdx);
+        } else {
+            std::cout << "잘못된 라즈베리파이 번호입니다." << std::endl;
+        }
     } else {
         std::cout << "입력 형식이 올바르지 않습니다." << std::endl;
     }
@@ -260,183 +355,73 @@ void userInputHandler() {
     }
 }
 
-// 클라이언트 처리 함수
-void handleClient(int clientSocket, const std::string& clientAddr) {
-    std::cout << "연결됨: " << clientAddr << std::endl;
-
-    char buffer[BUFFER_SIZE];
-    bool isRaspberryPi = false;
-
-    try {
-        // 초기 메시지 수신으로 클라이언트 유형 판별
-        memset(buffer, 0, BUFFER_SIZE);
-        int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
+// 하트비트 정리 스레드
+void heartbeatCleanupThread() {
+    while (serverRunning) {
+        std::this_thread::sleep_for(std::chrono::seconds(60)); // 1분마다 정리
         
-        if (bytesReceived <= 0) {
-            std::cerr << "초기 데이터 수신 실패" << std::endl;
-            close(clientSocket);
-            return;
-        }
+        std::lock_guard<std::mutex> lock(connectedRaspberryPisMutex);
+        auto now = std::chrono::system_clock::now();
         
-        std::string dataStr(buffer);
-        json clientData;
-        
-        try {
-            clientData = json::parse(dataStr);
-            // 클라이언트 유형 확인
-            if (clientData.contains("client_type") && clientData["client_type"] == "raspberry_pi") {
-                isRaspberryPi = true;
-                std::cout << "라즈베리 파이 클라이언트 연결됨: " << clientAddr << std::endl;
-                
-                // 라즈베리 파이 소켓 목록에 추가
-                {
-                    std::lock_guard<std::mutex> lock(clientsMutex);
-                    raspberryPiSockets.push_back(clientSocket);
-                    socketToAddress[clientSocket] = clientAddr;
-                }
-                
-                // 라즈베리 파이에게 연결 확인 응답
-                json response = {
-                    {"status", "connected"},
-                    {"message", "라즈베리 파이 연결 성공"}
-                };
-                std::string responseStr = response.dump();
-                send(clientSocket, responseStr.c_str(), responseStr.length(), 0);
+        auto it = connectedRaspberryPis.begin();
+        while (it != connectedRaspberryPis.end()) {
+            auto timeDiff = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+            if (timeDiff > 300) { // 5분 이상 비활성화
+                std::cout << "🗑️ 비활성 라즈베리파이 제거: " << it->first << std::endl;
+                it = connectedRaspberryPis.erase(it);
+            } else {
+                ++it;
             }
         }
-        catch (const json::parse_error& e) {
-            std::cerr << "JSON 파싱 오류: " << e.what() << std::endl;
-            close(clientSocket);
-            return;
-        }
-        
-        // 연결 유지 및 데이터 수신
-        while (serverRunning) {
-            memset(buffer, 0, BUFFER_SIZE);
-            int bytesReceived = recv(clientSocket, buffer, BUFFER_SIZE - 1, 0);
-
-            if (bytesReceived <= 0) {
-                break; // 연결 종료 또는 오류
-            }
-
-            // 수신 데이터 확인 (센서 데이터 등)
-            std::cout << "📡 " << clientAddr << "로부터 데이터 수신: " << buffer << std::endl;
-        }
     }
-    catch (const std::exception& e) {
-        std::cerr << "클라이언트 처리 오류: " << e.what() << std::endl;
-    }
-
-    // 라즈베리 파이 소켓 목록에서 제거
-    if (isRaspberryPi) {
-        std::lock_guard<std::mutex> lock(clientsMutex);
-        raspberryPiSockets.erase(
-            std::remove(raspberryPiSockets.begin(), raspberryPiSockets.end(), clientSocket),
-            raspberryPiSockets.end()
-        );
-        socketToAddress.erase(clientSocket);
-    }
-
-    // 연결 종료
-    close(clientSocket);
-    std::cout << "연결 종료: " << clientAddr << std::endl;
 }
 
 int main() {
-    // 소켓 생성
-    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket == -1) {
-        std::cerr << "소켓 생성 실패" << std::endl;
-        return 1;
-    }
-
-    // 소켓 옵션 설정 (재사용)
-    int opt = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        std::cerr << "소켓 옵션 설정 실패" << std::endl;
-        close(serverSocket);
-        return 1;
-    }
-
-    // 서버 주소 설정
-    struct sockaddr_in serverAddr;
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY; // 모든 인터페이스에서 연결 허용
-    serverAddr.sin_port = htons(PORT);
-
-    // 바인딩
-    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
-        std::cerr << "바인딩 실패" << std::endl;
-        close(serverSocket);
-        return 1;
-    }
-
-    // 리스닝
-    if (listen(serverSocket, MAX_CONNECTIONS) < 0) {
-        std::cerr << "리스닝 실패" << std::endl;
-        close(serverSocket);
-        return 1;
-    }
-
-    std::cout << "🚀 AGV 명령 서버가 포트 " << PORT << "에서 실행 중..." << std::endl;
+    // Mosquitto 라이브러리 초기화
+    mosquitto_lib_init();
     
-    // 사용자 입력 처리 스레드 시작
-    std::thread inputThread(userInputHandler);
-    inputThread.detach();
-
-    // 메인 루프 - 클라이언트 연결 처리
-    try {
-        while (serverRunning) {
-            struct sockaddr_in clientAddr;
-            socklen_t clientAddrLen = sizeof(clientAddr);
-
-            // 클라이언트 연결 수락 (논블로킹으로 설정하거나 타임아웃 설정)
-            fd_set readfds;
-            FD_ZERO(&readfds);
-            FD_SET(serverSocket, &readfds);
-            
-            struct timeval timeout;
-            timeout.tv_sec = 1;  // 1초 타임아웃
-            timeout.tv_usec = 0;
-            
-            int activity = select(serverSocket + 1, &readfds, NULL, NULL, &timeout);
-            
-            if (activity < 0) {
-                if (!serverRunning) break;
-                continue;
-            }
-            
-            if (activity == 0) {
-                // 타임아웃 - 서버 종료 확인
-                continue;
-            }
-            
-            if (FD_ISSET(serverSocket, &readfds)) {
-                int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
-                if (clientSocket < 0) {
-                    if (!serverRunning) break;
-                    std::cerr << "연결 수락 실패" << std::endl;
-                    continue;
-                }
-
-                // 클라이언트 주소 정보 가져오기
-                char clientIp[INET_ADDRSTRLEN];
-                inet_ntop(AF_INET, &(clientAddr.sin_addr), clientIp, INET_ADDRSTRLEN);
-                std::string clientAddrStr = std::string(clientIp) + ":" + std::to_string(ntohs(clientAddr.sin_port));
-
-                // 클라이언트 처리 스레드 생성
-                std::thread clientThread(handleClient, clientSocket, clientAddrStr);
-                clientThread.detach();
-            }
-        }
+    // MQTT 클라이언트 생성
+    mosq = mosquitto_new("central_server", true, nullptr);
+    if (!mosq) {
+        std::cerr << "MQTT 클라이언트 생성 실패" << std::endl;
+        mosquitto_lib_cleanup();
+        return 1;
     }
-    catch (const std::exception& e) {
-        std::cerr << "서버 오류: " << e.what() << std::endl;
+    
+    // 인증 설정
+    mosquitto_username_pw_set(mosq, MQTT_USERNAME.c_str(), MQTT_PASSWORD.c_str());
+    
+    // 콜백 설정
+    mosquitto_connect_callback_set(mosq, on_connect);
+    mosquitto_message_callback_set(mosq, on_message);
+    
+    // 브로커 연결
+    int result = mosquitto_connect(mosq, MQTT_BROKER_HOST.c_str(), MQTT_BROKER_PORT, 60);
+    if (result != MOSQ_ERR_SUCCESS) {
+        std::cerr << "MQTT 브로커 연결 실패: " << mosquitto_strerror(result) << std::endl;
+        mosquitto_destroy(mosq);
+        mosquitto_lib_cleanup();
+        return 1;
     }
-
-    // 소켓 닫기
-    close(serverSocket);
+    
+    std::cout << "🚀 AGV 명령 서버가 시작되었습니다..." << std::endl;
+    std::cout << "MQTT 브로커: " << MQTT_BROKER_HOST << ":" << MQTT_BROKER_PORT << std::endl;
+    
+    // MQTT 루프 시작
+    mosquitto_loop_start(mosq);
+    
+    // 하트비트 정리 스레드 시작
+    std::thread cleanupThread(heartbeatCleanupThread);
+    cleanupThread.detach();
+    
+    // 사용자 입력 처리 시작
+    userInputHandler();
+    
+    // 정리
+    mosquitto_loop_stop(mosq, true);
+    mosquitto_destroy(mosq);
+    mosquitto_lib_cleanup();
+    
     std::cout << "서버가 종료되었습니다." << std::endl;
-
     return 0;
 }
